@@ -1,12 +1,16 @@
 # nvim-ansible-vault
 
+99.99999% of this code is made by @19bischof. All credits go to him 
+
+This is a fork used only for my needs with no guarantees of support. Don't rely on code present here, fork it and make your on adaptations.
+
 A Neovim plugin for editing Ansible Vault — supports inline YAML values and whole-file vaults.
 
 ## Installation (Lazy.nvim)
 
 ```lua
 {
-  "19bischof/nvim-ansible-vault",
+  "hferreira23/nvim-ansible-vault",
   config = function()
     require("ansible-vault").setup({
       -- Omit ansible_cfg_directory to auto-detect nearest ansible.cfg (or .ansible.cfg)
@@ -18,7 +22,7 @@ A Neovim plugin for editing Ansible Vault — supports inline YAML values and wh
 }
 ```
 
-## Usage
+## 
 
 ### Default keybindings
 | Key | Action |
