@@ -127,6 +127,121 @@ test("refuses to replace externally changed vault files", function()
     end)
 end)
 
+test("atomically replaces ciphertext with plaintext and preserves permissions", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vault.yml")
+        assert(vim.fn.writefile(ciphertext, path) == 0)
+        assert(uv.fs_chmod(path, tonumber("640", 8)))
+        local original_stat = uv.fs_stat(path)
+
+        with_override(Core, "decrypt_file_content", function()
+            return "first line\nsecond line\n"
+        end, function()
+            local ok, err = Core.decrypt_file_to_plaintext({ debug = false }, path)
+            assert(ok, err)
+        end)
+
+        assert_equal(vim.fn.readfile(path, "b"), { "first line", "second line", "" })
+        local decrypted_stat = uv.fs_stat(path)
+        assert_equal(decrypted_stat.mode % 512, tonumber("640", 8))
+        assert_equal(decrypted_stat.uid, original_stat.uid)
+        assert_equal(decrypted_stat.gid, original_stat.gid)
+    end)
+end)
+
+test("keeps decrypted replacement files private until validation", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vault.yml")
+        assert(vim.fn.writefile(ciphertext, path) == 0)
+        assert(uv.fs_chmod(path, tonumber("644", 8)))
+        local original_lstat = uv.fs_lstat
+        local target_inspections = 0
+        local temporary_mode
+
+        with_override(Core, "decrypt_file_content", function()
+            return "plaintext\n"
+        end, function()
+            with_override(uv, "fs_lstat", function(inspected_path)
+                if inspected_path == path then
+                    target_inspections = target_inspections + 1
+                    if target_inspections == 2 then
+                        local temporary_files = vim.fn.globpath(
+                            dir,
+                            ".vault.yml.nvim-ansible-vault.*",
+                            false,
+                            true
+                        )
+                        assert_equal(#temporary_files, 1)
+                        temporary_mode = uv.fs_stat(temporary_files[1]).mode % 512
+                    end
+                end
+                return original_lstat(inspected_path)
+            end, function()
+                local ok, err = Core.decrypt_file_to_plaintext({ debug = false }, path)
+                assert(ok, err)
+            end)
+        end)
+
+        assert_equal(temporary_mode, tonumber("600", 8))
+        assert_equal(uv.fs_stat(path).mode % 512, tonumber("644", 8))
+    end)
+end)
+
+test("refuses to decrypt over an externally changed vault file", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vault.yml")
+        assert(vim.fn.writefile(ciphertext, path) == 0)
+
+        with_override(Core, "decrypt_file_content", function()
+            assert(vim.fn.writefile({ "external change" }, path) == 0)
+            return "plaintext\n"
+        end, function()
+            local ok, err = Core.decrypt_file_to_plaintext({ debug = false }, path)
+            assert(not ok and err:match("changed during decryption"), err)
+        end)
+
+        assert_equal(vim.fn.readfile(path), { "external change" })
+    end)
+end)
+
+test("uses byte-preserving decrypt output for permanent file decryption", function()
+    local command
+    with_override(vim, "system", function(args, opts)
+        command = args
+        assert_equal(opts.text, false)
+        return {
+            wait = function()
+                return { code = 0, stdout = "no-final-newline", stderr = "" }
+            end,
+        }
+    end, function()
+        local plaintext, err = Core.decrypt_file_content({ vault_executable = "ansible-vault" }, "/tmp/vault.yml")
+        assert(plaintext, err)
+        assert_equal(plaintext, "no-final-newline")
+    end)
+
+    assert_equal(command, { "ansible-vault", "decrypt", "--output=-", "/tmp/vault.yml" })
+end)
+
+test("uses byte-preserving decrypt output for inline values", function()
+    local command
+    with_override(vim, "system", function(args, opts)
+        command = args
+        assert_equal(opts.text, false)
+        return {
+            wait = function()
+                return { code = 0, stdout = "inline-secret", stderr = "" }
+            end,
+        }
+    end, function()
+        local plaintext, err = Core.decrypt_inline_content({ vault_executable = "ansible-vault" }, ciphertext)
+        assert(plaintext, err)
+        assert_equal(plaintext, "inline-secret")
+    end)
+
+    assert_equal(command, { "ansible-vault", "decrypt", "--output=-", "-" })
+end)
+
 test("refuses to replace hard-linked vault files", function()
     with_temp_dir(function(dir)
         local path = vim.fs.joinpath(dir, "vault.yml")
@@ -340,6 +455,182 @@ test("does not reload over buffer changes made during encryption", function()
         assert_equal(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), { "newer buffer content" })
         assert(vim.bo[bufnr].modified)
         assert_equal(vim.fn.readfile(path), ciphertext)
+        vim.cmd("bwipeout!")
+    end)
+end)
+
+test("permanently decrypts a whole file after plaintext confirmation", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vault.yml")
+        assert(vim.fn.writefile(ciphertext, path) == 0)
+        vim.cmd("edit " .. vim.fn.fnameescape(path))
+        local bufnr = vim.api.nvim_get_current_buf()
+        local buffer_path = vim.api.nvim_buf_get_name(bufnr)
+
+        with_override(vim.ui, "select", function(items, opts, callback)
+            assert_equal(items, { "Cancel", "Decrypt permanently" })
+            assert(opts.prompt:match("plaintext"))
+            callback("Decrypt permanently")
+        end, function()
+            with_override(Core, "decrypt_file_to_plaintext", function(_, output_path, _, expected_fingerprint)
+                assert_equal(output_path, buffer_path)
+                assert(type(expected_fingerprint) == "string" and expected_fingerprint ~= "")
+                assert(vim.fn.writefile({ "plain secret" }, path) == 0)
+                return true
+            end, function()
+                Vault.decrypt_current_file(bufnr)
+            end)
+        end)
+
+        assert_equal(vim.fn.readfile(path), { "plain secret" })
+        assert_equal(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), { "plain secret" })
+        assert(not vim.bo[bufnr].modified)
+        vim.cmd("bwipeout!")
+    end)
+end)
+
+test("cancels whole-file decryption if the destination changes during confirmation", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vault.yml")
+        assert(vim.fn.writefile(ciphertext, path) == 0)
+        vim.cmd("edit " .. vim.fn.fnameescape(path))
+        local bufnr = vim.api.nvim_get_current_buf()
+        local confirm
+        local attempts = 0
+
+        with_override(vim.ui, "select", function(_, _, callback)
+            confirm = callback
+        end, function()
+            with_override(Core, "decrypt_file_to_plaintext", function()
+                attempts = attempts + 1
+                return true
+            end, function()
+                Vault.decrypt_current_file(bufnr)
+                assert(vim.fn.writefile({ "external destination change" }, path) == 0)
+                confirm("Decrypt permanently")
+            end)
+        end)
+
+        assert_equal(attempts, 0)
+        assert_equal(vim.fn.readfile(path), { "external destination change" })
+        vim.cmd("bwipeout!")
+    end)
+end)
+
+test("refuses whole-file decryption when the buffer predates the destination", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vault.yml")
+        assert(vim.fn.writefile(ciphertext, path) == 0)
+        vim.cmd("edit " .. vim.fn.fnameescape(path))
+        local bufnr = vim.api.nvim_get_current_buf()
+        assert(vim.fn.writefile({ "external destination change" }, path) == 0)
+        local attempts = 0
+
+        with_override(Core, "decrypt_file_to_plaintext", function()
+            attempts = attempts + 1
+            return true
+        end, function()
+            Vault.decrypt_current_file(bufnr)
+        end)
+
+        assert_equal(attempts, 0)
+        assert_equal(vim.fn.readfile(path), { "external destination change" })
+        vim.cmd("bwipeout!")
+    end)
+end)
+
+test("permanently decrypts an inline vault without removing following lines", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vars.yml")
+        local encrypted = {
+            "secret: !vault |-",
+            "  $ANSIBLE_VAULT;1.1;AES256",
+            "  616263",
+            "",
+            "next: value",
+        }
+        assert(vim.fn.writefile(encrypted, path) == 0)
+        vim.cmd("edit " .. vim.fn.fnameescape(path))
+        local bufnr = vim.api.nvim_get_current_buf()
+        vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+        with_override(vim.ui, "select", function(_, opts, callback)
+            assert(opts.prompt:match("plaintext"))
+            callback("Decrypt permanently")
+        end, function()
+            with_override(Core, "decrypt_inline_content", function()
+                return "line one\nline two\n"
+            end, function()
+                Vault.decrypt_inline_at_cursor(bufnr)
+            end)
+        end)
+
+        assert_equal(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), {
+            'secret: "line one\\nline two\\n"',
+            "",
+            "next: value",
+        })
+        assert(vim.bo[bufnr].modified)
+        vim.cmd("bwipeout!")
+    end)
+end)
+
+test("cancels inline decryption if the buffer changes during confirmation", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vars.yml")
+        assert(vim.fn.writefile({
+            "secret: !vault |-",
+            "  $ANSIBLE_VAULT;1.1;AES256",
+            "  616263",
+        }, path) == 0)
+        vim.cmd("edit " .. vim.fn.fnameescape(path))
+        local bufnr = vim.api.nvim_get_current_buf()
+        vim.api.nvim_win_set_cursor(0, { 2, 0 })
+        local confirm
+        local attempts = 0
+
+        with_override(vim.ui, "select", function(_, _, callback)
+            confirm = callback
+        end, function()
+            with_override(Core, "decrypt_inline_content", function()
+                attempts = attempts + 1
+                return "plaintext"
+            end, function()
+                Vault.decrypt_inline_at_cursor(bufnr)
+                vim.api.nvim_buf_set_lines(bufnr, 0, 1, false, { "changed: true" })
+                confirm("Decrypt permanently")
+            end)
+        end)
+
+        assert_equal(attempts, 0)
+        assert_equal(vim.api.nvim_buf_get_lines(bufnr, 0, 1, false), { "changed: true" })
+        vim.cmd("bwipeout!")
+    end)
+end)
+
+test("escapes YAML line-break codepoints in decrypted inline values", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vars.yml")
+        assert(vim.fn.writefile({
+            "secret: !vault |-",
+            "  $ANSIBLE_VAULT;1.1;AES256",
+            "  616263",
+        }, path) == 0)
+        vim.cmd("edit " .. vim.fn.fnameescape(path))
+        local bufnr = vim.api.nvim_get_current_buf()
+        vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+        with_override(vim.ui, "select", function(_, _, callback)
+            callback("Decrypt permanently")
+        end, function()
+            with_override(Core, "decrypt_inline_content", function()
+                return "a\194\133b\226\128\168c\226\128\169d"
+            end, function()
+                Vault.decrypt_inline_at_cursor(bufnr)
+            end)
+        end)
+
+        assert_equal(vim.api.nvim_buf_get_lines(bufnr, 0, 1, false), { 'secret: "a\\Nb\\Lc\\Pd"' })
         vim.cmd("bwipeout!")
     end)
 end)

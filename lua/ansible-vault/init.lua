@@ -14,6 +14,27 @@ M.config = {
 
 local vault_buffers = {}
 
+local function cursor_line_for_buffer(bufnr)
+    local current_win = vim.api.nvim_get_current_win()
+    if vim.api.nvim_win_get_buf(current_win) == bufnr then
+        return vim.api.nvim_win_get_cursor(current_win)[1]
+    end
+    for _, winid in ipairs(vim.fn.win_findbuf(bufnr)) do
+        if vim.api.nvim_win_is_valid(winid) then
+            return vim.api.nvim_win_get_cursor(winid)[1]
+        end
+    end
+    return nil
+end
+
+local function file_stamp(file_path)
+    local stat, _, code = uv.fs_stat(file_path)
+    if not stat then
+        return code or "missing"
+    end
+    return table.concat({ stat.dev, stat.ino, stat.size, stat.mtime.sec, stat.mtime.nsec }, ":")
+end
+
 function M.setup(opts)
     vim.validate({ opts = { opts, "table", true } })
     M.config = vim.tbl_deep_extend("force", M.config, opts or {})
@@ -83,7 +104,8 @@ function M.vault_access(bufnr)
     end
 
     local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-    local vault_block = Core.find_inline_vault_block_at_cursor(lines)
+    local cursor_line = cursor_line_for_buffer(bufnr)
+    local vault_block = cursor_line and Core.find_inline_vault_block_at_cursor(lines, cursor_line) or nil
     local vault_type = Core.VaultType.inline
     ---@type string
     local vault_name = vault_block and vault_block.key or file_path
@@ -279,14 +301,7 @@ local function encrypt_checked_buffer(bufnr, file_path)
     try_encrypt()
 end
 
-function M.encrypt_current_file(bufnr)
-    bufnr = bufnr or vim.api.nvim_get_current_buf()
-    local file_path = vim.api.nvim_buf_get_name(bufnr)
-    if file_path == "" then
-        vim.notify("Cannot encrypt without a file path", vim.log.levels.ERROR)
-        return
-    end
-
+local function destination_matches_buffer(bufnr, file_path, action)
     local external_change = false
     local check_autocmd = vim.api.nvim_create_autocmd("FileChangedShell", {
         buffer = bufnr,
@@ -304,19 +319,21 @@ function M.encrypt_current_file(bufnr)
     pcall(vim.api.nvim_del_autocmd, check_autocmd)
     if not checked then
         vim.notify("Cannot check the destination file: " .. check_err, vim.log.levels.ERROR)
-        return
+        return false
     end
     if external_change then
-        vim.notify("Encryption cancelled because the destination changed on disk", vim.log.levels.WARN)
-        return
+        vim.notify(action .. " cancelled because the destination changed on disk", vim.log.levels.WARN)
+        return false
     end
 
     if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_name(bufnr) ~= file_path then
-        vim.notify("Encryption cancelled because the source buffer is no longer available", vim.log.levels.WARN)
-        return
+        vim.notify(action .. " cancelled because the source buffer is no longer available", vim.log.levels.WARN)
+        return false
     end
 
+    local checked_stamp
     if not vim.bo[bufnr].modified and vim.fn.filereadable(file_path) == 1 then
+        local before_read = file_stamp(file_path)
         local buffer_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
         local disk_lines = vim.fn.readfile(file_path)
         if #disk_lines == 0 then
@@ -324,21 +341,223 @@ function M.encrypt_current_file(bufnr)
         end
         local binary_lines = vim.fn.readfile(file_path, "b")
         local disk_has_eol = binary_lines[#binary_lines] == ""
-        if not vim.deep_equal(buffer_lines, disk_lines) or vim.bo[bufnr].endofline ~= disk_has_eol then
-            vim.notify("Encryption cancelled because the destination changed on disk", vim.log.levels.WARN)
-            return
+        local after_read = file_stamp(file_path)
+        if
+            before_read ~= after_read
+            or not vim.deep_equal(buffer_lines, disk_lines)
+            or vim.bo[bufnr].endofline ~= disk_has_eol
+        then
+            vim.notify(action .. " cancelled because the destination changed on disk", vim.log.levels.WARN)
+            return false
         end
+        checked_stamp = after_read
+    end
+
+    return checked_stamp or file_stamp(file_path)
+end
+
+function M.encrypt_current_file(bufnr)
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    local file_path = vim.api.nvim_buf_get_name(bufnr)
+    if file_path == "" then
+        vim.notify("Cannot encrypt without a file path", vim.log.levels.ERROR)
+        return
+    end
+    if not destination_matches_buffer(bufnr, file_path, "Encryption") then
+        return
     end
 
     encrypt_checked_buffer(bufnr, file_path)
+end
+
+local function confirm_permanent_decryption(target, callback)
+    vim.ui.select({ "Cancel", "Decrypt permanently" }, {
+        prompt = "Write " .. target .. " as plaintext?",
+    }, function(choice)
+        if choice == "Decrypt permanently" then
+            callback()
+        end
+    end)
+end
+
+function M.decrypt_current_file(bufnr)
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    local file_path = vim.api.nvim_buf_get_name(bufnr)
+    if file_path == "" then
+        vim.notify("Cannot decrypt without a file path", vim.log.levels.ERROR)
+        return
+    end
+    if vim.bo[bufnr].modified then
+        vim.notify("Save or discard ciphertext changes before decrypting this file", vim.log.levels.WARN)
+        return
+    end
+    local destination_stamp = destination_matches_buffer(bufnr, file_path, "Decryption")
+    if not destination_stamp then
+        return
+    end
+
+    local first_line = vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1] or ""
+    if not first_line:match("^%$ANSIBLE_VAULT;") then
+        vim.notify("Current file is not an Ansible Vault", vim.log.levels.WARN)
+        return
+    end
+
+    local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+    local cfg = resolve_config_for_file(file_path)
+
+    local function source_is_unchanged(check_destination)
+        if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_name(bufnr) ~= file_path then
+            vim.notify("Decryption cancelled because the source buffer is no longer available", vim.log.levels.WARN)
+            return false
+        end
+        if vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick then
+            vim.notify("Decryption cancelled because the source buffer changed", vim.log.levels.WARN)
+            return false
+        end
+        if check_destination and file_stamp(file_path) ~= destination_stamp then
+            vim.notify("Decryption cancelled because the destination file changed", vim.log.levels.WARN)
+            return false
+        end
+        return true
+    end
+
+    local function finish_decryption()
+        if not source_is_unchanged(false) then
+            vim.notify("File was decrypted, but its changed source buffer was not reloaded", vim.log.levels.WARN)
+            return
+        end
+        local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
+            vim.cmd("silent keepalt edit!")
+        end)
+        if not ok then
+            vim.notify("File was decrypted, but its buffer could not be reloaded: " .. err, vim.log.levels.ERROR)
+            return
+        end
+        vim.notify("File permanently decrypted to plaintext", vim.log.levels.WARN)
+    end
+
+    local try_decrypt
+    try_decrypt = function(opts)
+        if not source_is_unchanged(true) then
+            return
+        end
+        local ok, err = Core.decrypt_file_to_plaintext(cfg, file_path, opts, destination_stamp)
+        if ok then
+            finish_decryption()
+            return
+        end
+
+        if err and (err:match("[Pp]assword") or err:match("[Vv]ault")) and not (opts and opts.password) then
+            pcall(vim.cmd, "stopinsert")
+            vim.schedule(function()
+                local password = vim.fn.inputsecret("Vault password (one-time): ")
+                if not password or password == "" then
+                    vim.notify("Decryption cancelled (no password provided)", vim.log.levels.WARN)
+                    return
+                end
+                try_decrypt({ password = password })
+            end)
+            return
+        end
+        vim.notify("Failed to decrypt file: " .. (err or "unknown error"), vim.log.levels.ERROR)
+    end
+
+    confirm_permanent_decryption("the entire file", function()
+        try_decrypt()
+    end)
+end
+
+function M.decrypt_inline_at_cursor(bufnr)
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    local file_path = vim.api.nvim_buf_get_name(bufnr)
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local cursor_line = cursor_line_for_buffer(bufnr)
+    if not cursor_line then
+        vim.notify("Cannot decrypt an inline vault in a hidden buffer", vim.log.levels.WARN)
+        return
+    end
+    local vault_block = Core.find_inline_vault_block_at_cursor(lines, cursor_line)
+    if not vault_block then
+        vim.notify("No inline vault found at cursor", vim.log.levels.WARN)
+        return
+    end
+
+    local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+    local cfg = resolve_config_for_file(file_path)
+
+    local function source_is_unchanged()
+        return vim.api.nvim_buf_is_valid(bufnr)
+            and vim.api.nvim_buf_get_name(bufnr) == file_path
+            and vim.api.nvim_buf_get_changedtick(bufnr) == changedtick
+    end
+
+    local function apply_plaintext(plaintext)
+        if not source_is_unchanged() then
+            vim.notify("Decryption cancelled because the source buffer changed", vim.log.levels.WARN)
+            return
+        end
+
+        local header = lines[vault_block.start_line]
+        local indent = header:match("^(%s*)") or ""
+        local encoded_ok, encoded = pcall(vim.json.encode, plaintext)
+        if not encoded_ok then
+            vim.notify("Failed to encode decrypted value as YAML: " .. encoded, vim.log.levels.ERROR)
+            return
+        end
+        encoded = encoded:gsub("\194\133", "\\N"):gsub("\226\128\168", "\\L"):gsub("\226\128\169", "\\P")
+
+        local end_line = vault_block.start_line + #vault_block.vault_content
+        vim.api.nvim_buf_set_lines(
+            bufnr,
+            vault_block.start_line - 1,
+            end_line,
+            false,
+            { string.format("%s%s: %s", indent, vault_block.key, encoded) }
+        )
+        vim.notify("Inline value permanently decrypted; save to persist plaintext", vim.log.levels.WARN)
+    end
+
+    local function try_decrypt(opts)
+        if not source_is_unchanged() then
+            vim.notify("Decryption cancelled because the source buffer changed", vim.log.levels.WARN)
+            return
+        end
+
+        local plaintext, err = Core.decrypt_inline_content(cfg, vault_block.vault_content, opts)
+        if plaintext then
+            apply_plaintext(plaintext)
+            return
+        end
+
+        if err and (err:match("[Pp]assword") or err:match("[Vv]ault")) and not (opts and opts.password) then
+            pcall(vim.cmd, "stopinsert")
+            vim.schedule(function()
+                local password = vim.fn.inputsecret("Vault password (one-time): ")
+                if not password or password == "" then
+                    vim.notify("Decryption cancelled (no password provided)", vim.log.levels.WARN)
+                    return
+                end
+                try_decrypt({ password = password })
+            end)
+            return
+        end
+        vim.notify("Failed to decrypt inline value: " .. (err or "unknown error"), vim.log.levels.ERROR)
+    end
+
+    confirm_permanent_decryption("this inline value", function()
+        try_decrypt()
+    end)
 end
 
 ---Encrypt the YAML scalar value at cursor into an inline vault block
 ---@param bufnr? integer
 function M.encrypt_inline_at_cursor(bufnr)
     bufnr = bufnr or vim.api.nvim_get_current_buf()
-    local cursor = vim.api.nvim_win_get_cursor(0)
-    local line_nr = cursor[1]
+    local line_nr = cursor_line_for_buffer(bufnr)
+    if not line_nr then
+        vim.notify("Cannot encrypt an inline value in a hidden buffer", vim.log.levels.WARN)
+        return
+    end
     local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
     local line = lines[line_nr]
     if not line then

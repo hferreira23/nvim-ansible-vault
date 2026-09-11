@@ -47,13 +47,19 @@ local function remove_file(path)
 	return true
 end
 
-local function write_secure_file(path, content, mode)
+local function write_secure_file(path, content, mode, uid, gid)
 	local fd, open_err = uv.fs_open(path, "wx", mode)
 	if not fd then
 		return nil, open_err or "failed to open file"
 	end
 
-	local ok, err = uv.fs_fchmod(fd, mode)
+	local ok, err = true, nil
+	if uid and gid then
+		ok, err = uv.fs_fchown(fd, uid, gid)
+	end
+	if ok then
+		ok, err = uv.fs_fchmod(fd, mode)
+	end
 	if ok then
 		ok, err = write_all(fd, content)
 	end
@@ -121,15 +127,13 @@ local function inspect_destination(file_path)
 	return {
 		target_path = target_path,
 		mode = file_stat and (file_stat.mode % 512) or tonumber("600", 8),
+		uid = file_stat and file_stat.uid or nil,
+		gid = file_stat and file_stat.gid or nil,
 		fingerprint = fingerprint,
 	}
 end
 
-local function atomic_write_ciphertext(file_path, lines, expected)
-	if not lines or not lines[1] or not lines[1]:match("^%$ANSIBLE_VAULT;") then
-		return nil, "Refusing to write invalid Ansible Vault ciphertext"
-	end
-
+local function atomic_replace(file_path, content, expected, operation)
 	local temp_path = vim.fs.joinpath(
 		vim.fs.dirname(expected.target_path),
 		string.format(
@@ -139,16 +143,21 @@ local function atomic_write_ciphertext(file_path, lines, expected)
 			uv.hrtime()
 		)
 	)
-	local content = table.concat(lines, "\n") .. "\n"
-	local wrote, write_err = write_secure_file(temp_path, content, expected.mode)
+	local wrote, write_err = write_secure_file(temp_path, content, tonumber("600", 8), expected.uid, expected.gid)
 	if not wrote then
-		return nil, "Failed to write encrypted temporary file: " .. (write_err or "unknown error")
+		return nil, "Failed to write replacement temporary file: " .. (write_err or "unknown error")
 	end
 
 	local current, inspect_err = inspect_destination(file_path)
 	if not current or current.target_path ~= expected.target_path or current.fingerprint ~= expected.fingerprint then
 		remove_file(temp_path)
-		return nil, inspect_err or "Vault file changed during encryption; refusing to overwrite it"
+		return nil, inspect_err or "Vault file changed during " .. operation .. "; refusing to overwrite it"
+	end
+
+	local permissions_set, permissions_err = uv.fs_chmod(temp_path, expected.mode)
+	if not permissions_set then
+		remove_file(temp_path)
+		return nil, "Failed to preserve vault file permissions: " .. (permissions_err or "unknown error")
 	end
 
 	local renamed, rename_err = uv.fs_rename(temp_path, expected.target_path)
@@ -157,6 +166,13 @@ local function atomic_write_ciphertext(file_path, lines, expected)
 		return nil, "Failed to replace vault file: " .. (rename_err or "unknown error")
 	end
 	return true
+end
+
+local function atomic_write_ciphertext(file_path, lines, expected)
+	if not lines or not lines[1] or not lines[1]:match("^%$ANSIBLE_VAULT;") then
+		return nil, "Refusing to write invalid Ansible Vault ciphertext"
+	end
+	return atomic_replace(file_path, table.concat(lines, "\n") .. "\n", expected, "encryption")
 end
 
 Core.VaultType = { inline = "inline", file = "file" }
@@ -222,14 +238,24 @@ end
 ---@param args string[]
 ---@param stdin string
 ---@return { code: integer, stdout: string, stderr: string }
-local function run_with_stdin(args, stdin, cwd)
-	local proc = vim.system(args, { stdin = stdin, text = true, cwd = cwd })
+local function run_with_stdin(args, stdin, cwd, text)
+	local proc = vim.system(args, { stdin = stdin, text = text ~= false, cwd = cwd })
 	local res = proc:wait()
 	-- Normalize fields if older signatures change
 	res.stdout = res.stdout or ""
 	res.stderr = res.stderr or ""
 	-- Avoid logging stdin content; only sizes
 	return res
+end
+
+local function get_decrypt_command(config, input, password_file)
+	local cmd = { get_executable(config), "decrypt", "--output=-" }
+	local resolved_password_file = password_file or config.vault_password_file
+	if resolved_password_file then
+		vim.list_extend(cmd, { "--vault-password-file", resolved_password_file })
+	end
+	table.insert(cmd, input)
+	return cmd
 end
 
 ---Build ansible-vault command
@@ -263,8 +289,8 @@ function Core.check_is_file_vault(config, file_path)
 	return first_line and first_line:match("^%$ANSIBLE_VAULT;") ~= nil
 end
 
-function Core.find_inline_vault_block_at_cursor(lines)
-	local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+function Core.find_inline_vault_block_at_cursor(lines, cursor_line)
+	cursor_line = cursor_line or vim.api.nvim_win_get_cursor(0)[1]
 	if cursor_line > #lines then
 		return nil
 	end
@@ -335,12 +361,15 @@ function Core.decrypt_inline_content(config, vault_content, opts)
 	for _, l in ipairs(vault_content) do
 		stripped[#stripped + 1] = (l:gsub("^%s+", ""))
 	end
-	Core.debug(config, string.format("decrypt_inline via stdin(view) lines=%d", #stripped))
-	local args = { get_executable(config), "view", "-" }
+	Core.debug(config, string.format("decrypt_inline via stdin(decrypt) lines=%d", #stripped))
 	if opts and opts.password and opts.password ~= "" then
 		local res, password_err = with_temporary_password_file(opts.password, function(password_file)
-			local password_args = vim.list_extend(vim.deepcopy(args), { "--vault-password-file", password_file })
-			return run_with_stdin(password_args, table.concat(stripped, "\n"), get_cwd(config))
+			return run_with_stdin(
+				get_decrypt_command(config, "-", password_file),
+				table.concat(stripped, "\n"),
+				get_cwd(config),
+				false
+			)
 		end)
 		if not res then
 			return nil, password_err
@@ -349,14 +378,16 @@ function Core.decrypt_inline_content(config, vault_content, opts)
 			return nil, res.stderr ~= "" and res.stderr or res.stdout or "decrypt failed"
 		end
 		return res.stdout
-	elseif config.vault_password_file then
-		table.insert(args, "--vault-password-file")
-		table.insert(args, config.vault_password_file)
 	end
-	local res = run_with_stdin(args, table.concat(stripped, "\n"), get_cwd(config))
+	local res = run_with_stdin(
+		get_decrypt_command(config, "-"),
+		table.concat(stripped, "\n"),
+		get_cwd(config),
+		false
+	)
 	Core.debug(
 		config,
-		string.format("decrypt_inline(view) exit=%d out_len=%d err_len=%d", res.code or -1, #res.stdout, #res.stderr)
+		string.format("decrypt_inline(decrypt) exit=%d out_len=%d err_len=%d", res.code or -1, #res.stdout, #res.stderr)
 	)
 	if res.code ~= 0 then
 		return nil, res.stderr ~= "" and res.stderr or res.stdout or "decrypt failed"
@@ -468,6 +499,36 @@ function Core.decrypt_file_vault(config, file_path, opts)
 	return res.stdout
 end
 
+---@param config AnsibleVaultConfig
+---@param file_path string
+---@param opts? { password?: string }
+---@return string|nil, string|nil
+function Core.decrypt_file_content(config, file_path, opts)
+	Core.debug(config, string.format("decrypt_file_content file=%s", file_path))
+	local function decrypt(password_file)
+		return vim.system(get_decrypt_command(config, file_path, password_file), {
+			cwd = get_cwd(config),
+			text = false,
+		}):wait()
+	end
+
+	local res, password_err
+	if opts and opts.password and opts.password ~= "" then
+		res, password_err = with_temporary_password_file(opts.password, decrypt)
+	else
+		res = decrypt()
+	end
+	if not res then
+		return nil, password_err
+	end
+	if res.code ~= 0 then
+		local stderr = res.stderr or ""
+		local stdout = res.stdout or ""
+		return nil, stderr ~= "" and stderr or stdout ~= "" and stdout or "decrypt failed"
+	end
+	return res.stdout or ""
+end
+
 ---Encrypt a file by first encrypting provided plaintext and writing it to file
 ---@param config AnsibleVaultConfig
 ---@param file_path string
@@ -488,6 +549,32 @@ function Core.encrypt_file_with_content(config, file_path, plaintext, opts)
 		return nil, write_err
 	end
 	Core.debug(config, string.format("wrote encrypted file lines=%d", #enc_lines))
+	return true
+end
+
+---@param config AnsibleVaultConfig
+---@param file_path string
+---@param opts? { password?: string }
+---@param expected_fingerprint? string
+function Core.decrypt_file_to_plaintext(config, file_path, opts, expected_fingerprint)
+	Core.debug(config, string.format("decrypt_file_to_plaintext file=%s", file_path))
+	local destination, inspect_err = inspect_destination(file_path)
+	if not destination then
+		return nil, inspect_err
+	end
+	if expected_fingerprint and destination.fingerprint ~= expected_fingerprint then
+		return nil, "Vault file changed before decryption; refusing to overwrite it"
+	end
+
+	local plaintext, decrypt_err = Core.decrypt_file_content(config, file_path, opts)
+	if not plaintext then
+		return nil, decrypt_err
+	end
+
+	local wrote, write_err = atomic_replace(file_path, plaintext, destination, "decryption")
+	if not wrote then
+		return nil, write_err
+	end
 	return true
 end
 
