@@ -571,7 +571,19 @@ function M.encrypt_inline_at_cursor(bufnr)
         return
     end
 
+    local file_path = vim.api.nvim_buf_get_name(bufnr)
+    local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+    local function source_is_unchanged()
+        return vim.api.nvim_buf_is_valid(bufnr)
+            and vim.api.nvim_buf_get_name(bufnr) == file_path
+            and vim.api.nvim_buf_get_changedtick(bufnr) == changedtick
+    end
+
     local function apply_inline_enc(vault_lines)
+        if not source_is_unchanged() then
+            vim.notify("Inline encryption cancelled because the source buffer changed", vim.log.levels.WARN)
+            return
+        end
         local content_indent = indent .. "  "
         local new_header = string.format("%s%s: !vault |-", indent, key)
         local to_insert = {}
@@ -584,11 +596,23 @@ function M.encrypt_inline_at_cursor(bufnr)
         vim.notify("Inline value encrypted", vim.log.levels.INFO)
     end
 
-    local cfg = resolve_config_for_file(vim.api.nvim_buf_get_name(bufnr))
-    local vault_lines, err = Core.encrypt_content(cfg, value)
-    if not vault_lines then
+    local cfg = resolve_config_for_file(file_path)
+    local try_encrypt
+    try_encrypt = function(opts)
+        opts = opts or {}
+        if not source_is_unchanged() then
+            vim.notify("Inline encryption cancelled because the source buffer changed", vim.log.levels.WARN)
+            return
+        end
+
+        local vault_lines, err = Core.encrypt_content(cfg, value, next(opts) and opts or nil)
+        if vault_lines then
+            apply_inline_enc(vault_lines)
+            return
+        end
+
         local ids = Core.extract_encrypt_vault_ids(err or "")
-        if ids and #ids > 0 then
+        if ids and #ids > 0 and not opts.encrypt_vault_id then
             pcall(vim.cmd, "stopinsert")
             vim.schedule(function()
                 vim.ui.select(ids, { prompt = "Select vault-id for inline encryption" }, function(choice)
@@ -596,19 +620,28 @@ function M.encrypt_inline_at_cursor(bufnr)
                         vim.notify("Inline encryption cancelled", vim.log.levels.WARN)
                         return
                     end
-                    local retry_lines, retry_err = Core.encrypt_content(cfg, value, { encrypt_vault_id = choice })
-                    if not retry_lines then
-                        vim.notify(retry_err or "Failed to encrypt inline value", vim.log.levels.ERROR)
-                        return
-                    end
-                    apply_inline_enc(retry_lines)
+                    try_encrypt(vim.tbl_extend("force", {}, opts, { encrypt_vault_id = choice }))
                 end)
             end)
             return
         end
+
+        if err and err:match("[Pp]assword") and not opts.password then
+            pcall(vim.cmd, "stopinsert")
+            vim.schedule(function()
+                local password = vim.fn.inputsecret("Vault password (one-time): ")
+                if not password or password == "" then
+                    vim.notify("Inline encryption cancelled (no password provided)", vim.log.levels.WARN)
+                    return
+                end
+                try_encrypt(vim.tbl_extend("force", {}, opts, { password = password }))
+            end)
+            return
+        end
+
         vim.notify(err or "Failed to encrypt inline value", vim.log.levels.ERROR)
-        return
     end
-    apply_inline_enc(vault_lines)
+
+    try_encrypt()
 end
 return M

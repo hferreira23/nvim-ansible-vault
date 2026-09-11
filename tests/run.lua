@@ -459,6 +459,38 @@ test("does not reload over buffer changes made during encryption", function()
     end)
 end)
 
+test("cancels inline vault-ID retries after the source buffer changes", function()
+    with_temp_dir(function(dir)
+        local path = vim.fs.joinpath(dir, "vars.yml")
+        assert(vim.fn.writefile({ "secret: plaintext" }, path) == 0)
+        vim.cmd("edit " .. vim.fn.fnameescape(path))
+        local bufnr = vim.api.nvim_get_current_buf()
+        vim.api.nvim_win_set_cursor(0, { 1, 0 })
+        local select_callback
+        local attempts = 0
+
+        with_override(vim.ui, "select", function(_, _, callback)
+            select_callback = callback
+        end, function()
+            with_override(Core, "encrypt_content", function()
+                attempts = attempts + 1
+                return nil, "The vault-ids prod are available to encrypt"
+            end, function()
+                Vault.encrypt_inline_at_cursor(bufnr)
+                assert(vim.wait(1000, function()
+                    return select_callback ~= nil
+                end))
+                vim.api.nvim_buf_set_lines(bufnr, 0, 1, false, { "newer: value" })
+                select_callback("prod")
+            end)
+        end)
+
+        assert_equal(attempts, 1)
+        assert_equal(vim.api.nvim_buf_get_lines(bufnr, 0, 1, false), { "newer: value" })
+        vim.cmd("bwipeout!")
+    end)
+end)
+
 test("permanently decrypts a whole file after plaintext confirmation", function()
     with_temp_dir(function(dir)
         local path = vim.fs.joinpath(dir, "vault.yml")
