@@ -10,15 +10,30 @@ local Popup = {}
 ---@field vault_name string
 ---@field decrypted_value string
 ---@field vault_block? { start_line: integer, end_line: integer, vault_content: string[] }
+---@field password? string
 
 ---@param config table
 ---@param p PopupParams
 function Popup.open(config, p)
+    local closed = false
+    local selecting = false
+
     local function select_vault_id(ids, prompt, on_choice)
+        if closed then
+            return
+        end
+        selecting = true
         -- Ensure the upcoming select UI can capture keys even if user was in insert mode
         pcall(vim.cmd, "stopinsert")
         vim.schedule(function()
+            if closed then
+                return
+            end
             vim.ui.select(ids, { prompt = prompt }, function(choice)
+                selecting = false
+                if closed then
+                    return
+                end
                 on_choice(choice)
             end)
         end)
@@ -31,6 +46,9 @@ function Popup.open(config, p)
         table.remove(popup_lines)
     end
     local original_content = table.concat(popup_lines, "\n")
+    local had_trailing_newline = p.decrypted_value:sub(-1) == "\n"
+    local original_win = vim.api.nvim_get_current_win()
+    local source_changedtick = vim.api.nvim_buf_get_changedtick(p.bufnr)
 
     local popup_buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, popup_lines)
@@ -89,32 +107,18 @@ function Popup.open(config, p)
     vim.api.nvim_win_set_option(popup_win, "wrap", true)
     vim.api.nvim_win_set_option(popup_win, "cursorline", true)
 
-    -- Auto-close behavior when focus leaves this popup or another popup takes focus
     local autocmd_group = vim.api.nvim_create_augroup("AnsibleVaultPopup_" .. popup_win, { clear = true })
-    vim.api.nvim_create_autocmd("WinEnter", {
-        group = autocmd_group,
-        callback = function()
-            if not vim.api.nvim_win_is_valid(popup_win) then
-                return
-            end
-            local current_win = vim.api.nvim_get_current_win()
-            if current_win ~= popup_win then
-                if vim.api.nvim_win_is_valid(popup_win) then
-                    vim.api.nvim_win_close(popup_win, true)
-                end
-            end
-        end,
-    })
-    vim.api.nvim_create_autocmd("WinClosed", {
-        group = autocmd_group,
-        pattern = tostring(popup_win),
-        callback = function()
-            pcall(vim.api.nvim_del_augroup_by_id, autocmd_group)
-        end,
-    })
+    local function mark_closed()
+        if closed then
+            return
+        end
+        closed = true
+        p.password = nil
+        pcall(vim.api.nvim_del_augroup_by_id, autocmd_group)
+    end
 
     local function close_popup()
-        pcall(vim.api.nvim_del_augroup_by_id, autocmd_group)
+        mark_closed()
         if vim.api.nvim_win_is_valid(popup_win) then
             vim.api.nvim_win_close(popup_win, true)
         end
@@ -123,111 +127,217 @@ function Popup.open(config, p)
         end
     end
 
+    vim.api.nvim_create_autocmd("WinEnter", {
+        group = autocmd_group,
+        callback = function()
+            if not closed and not selecting and vim.api.nvim_get_current_win() ~= popup_win then
+                close_popup()
+            end
+        end,
+    })
+    vim.api.nvim_create_autocmd("WinClosed", {
+        group = autocmd_group,
+        pattern = tostring(popup_win),
+        callback = mark_closed,
+    })
+
+    local function source_is_unchanged()
+        if closed then
+            return false
+        end
+        if not vim.api.nvim_buf_is_valid(p.bufnr) or vim.api.nvim_buf_get_name(p.bufnr) ~= p.file_path then
+            vim.notify("Vault source buffer is no longer available", vim.log.levels.ERROR)
+            return false
+        end
+
+        if p.vault_type == Core.VaultType.file then
+            pcall(vim.api.nvim_buf_call, p.bufnr, function()
+                vim.cmd("silent checktime")
+            end)
+        end
+
+        if vim.api.nvim_buf_get_changedtick(p.bufnr) ~= source_changedtick then
+            vim.notify("Vault source changed while the popup was open; save cancelled", vim.log.levels.WARN)
+            return false
+        end
+        return true
+    end
+
+    local function source_can_reload()
+        if not vim.api.nvim_buf_is_valid(p.bufnr) or vim.api.nvim_buf_get_name(p.bufnr) ~= p.file_path then
+            vim.notify("Vault was saved, but its source buffer is no longer available", vim.log.levels.WARN)
+            return false
+        end
+        if vim.api.nvim_buf_get_changedtick(p.bufnr) ~= source_changedtick then
+            vim.notify("Vault was saved, but its changed source buffer was not reloaded", vim.log.levels.WARN)
+            return false
+        end
+        return true
+    end
+
+    local function reload_source_buffer()
+        local ok, err = pcall(vim.api.nvim_buf_call, p.bufnr, function()
+            vim.cmd("silent keepalt edit!")
+        end)
+        if not ok then
+            vim.notify("Vault was saved, but its source buffer could not be reloaded: " .. err, vim.log.levels.ERROR)
+        end
+    end
+
+    local function encryption_options(vault_id)
+        local opts = {}
+        if p.password and p.password ~= "" then
+            opts.password = p.password
+        end
+        if vault_id then
+            opts.encrypt_vault_id = vault_id
+        end
+        return next(opts) and opts or nil
+    end
+
+    local saving = false
+
     local function handle_save_and_close()
+        if closed or saving or not vim.api.nvim_buf_is_valid(popup_buf) then
+            return
+        end
+
         local current_lines = vim.api.nvim_buf_get_lines(popup_buf, 0, -1, false)
-        local current_content = table.concat(current_lines, "\n")
+        local edited_content = table.concat(current_lines, "\n")
         Core.debug(
             config,
             string.format(
                 "popup save changed=%s bytes=%d",
-                tostring(current_content ~= original_content),
-                #current_content
+                tostring(edited_content ~= original_content),
+                #edited_content
             )
         )
 
-        if current_content ~= original_content then
-            local function after_inline_encrypt_and_apply(vault_lines)
-                local current_src = vim.api.nvim_buf_get_lines(p.bufnr, 0, -1, false)
-                local modified_lines = vim.deepcopy(current_src)
+        if edited_content == original_content then
+            close_popup()
+            return
+        end
 
-                local original_content_indent = ""
-                if #p.vault_block.vault_content > 0 then
-                    original_content_indent = p.vault_block.vault_content[1]:match("^(%s*)") or ""
-                end
+        local current_content = edited_content
+        if p.vault_type == Core.VaultType.file and had_trailing_newline then
+            current_content = current_content .. "\n"
+        end
 
-                for j = p.vault_block.end_line, p.vault_block.start_line + 1, -1 do
-                    table.remove(modified_lines, j)
-                end
-                for j = #vault_lines, 1, -1 do
-                    table.insert(
-                        modified_lines,
-                        p.vault_block.start_line + 1,
-                        original_content_indent .. vault_lines[j]
-                    )
-                end
+        if not source_is_unchanged() then
+            return
+        end
+        saving = true
 
-                vim.api.nvim_buf_set_lines(p.bufnr, 0, -1, false, modified_lines)
+        local function fail(message)
+            saving = false
+            vim.notify(message, vim.log.levels.ERROR)
+        end
+
+        local function after_inline_encrypt_and_apply(vault_lines)
+            if not source_is_unchanged() then
+                saving = false
+                return
             end
 
-            if p.vault_type == Core.VaultType.inline and p.vault_block then
-                local vault_lines, encrypt_err = Core.encrypt_content(config, current_content)
-                if not vault_lines then
-                    local ids = Core.extract_encrypt_vault_ids(encrypt_err or "")
-                    if ids and #ids > 0 then
-                        select_vault_id(ids, "Select vault-id for encryption", function(choice)
-                            if not choice then
-                                vim.notify("Encryption cancelled (no vault-id selected)", vim.log.levels.WARN)
-                                return
-                            end
-                            local retry_lines, retry_err = Core.encrypt_content(
-                                config,
-                                current_content,
-                                { encrypt_vault_id = choice }
-                            )
-                            if not retry_lines then
-                                vim.notify(
-                                    "Failed to encrypt with selected vault-id: " .. (retry_err or "unknown error"),
-                                    vim.log.levels.ERROR
-                                )
-                                return
-                            end
-                            after_inline_encrypt_and_apply(retry_lines)
-                            close_popup()
-                        end)
-                        return -- wait for async select
-                    end
-                    vim.notify(
-                        "Failed to encrypt new content: " .. (encrypt_err or "unknown error"),
-                        vim.log.levels.ERROR
-                    )
-                    return
-                end
-                after_inline_encrypt_and_apply(vault_lines)
-            else
-                local ok, enc_err = Core.encrypt_file_with_content(config, p.file_path, current_content)
-                if not ok then
-                    local ids = Core.extract_encrypt_vault_ids(enc_err or "")
-                    if ids and #ids > 0 then
-                        select_vault_id(ids, "Select vault-id for file encryption", function(choice)
-                            if not choice then
-                                vim.notify("Encryption cancelled (no vault-id selected)", vim.log.levels.WARN)
-                                return
-                            end
-                            local retry_ok, retry_err = Core.encrypt_file_with_content(
-                                config,
-                                p.file_path,
-                                current_content,
-                                { encrypt_vault_id = choice }
-                            )
-                            if not retry_ok then
-                                vim.notify(retry_err or "Failed to encrypt file", vim.log.levels.ERROR)
-                                return
-                            end
-                            vim.notify("File encrypted successfully", vim.log.levels.INFO)
-                            Core.debug(config, "file encrypted via popup save")
-                            close_popup()
-                        end)
-                        return -- wait for async select
-                    end
-                    vim.notify(enc_err or "Failed to encrypt file", vim.log.levels.ERROR)
-                    return
-                end
-                vim.notify("File encrypted successfully", vim.log.levels.INFO)
-                Core.debug(config, "file encrypted via popup save")
+            local current_src = vim.api.nvim_buf_get_lines(p.bufnr, 0, -1, false)
+            local modified_lines = vim.deepcopy(current_src)
+            local original_content_indent = ""
+            if #p.vault_block.vault_content > 0 then
+                original_content_indent = p.vault_block.vault_content[1]:match("^(%s*)") or ""
+            end
+
+            for j = p.vault_block.end_line, p.vault_block.start_line + 1, -1 do
+                table.remove(modified_lines, j)
+            end
+            for j = #vault_lines, 1, -1 do
+                table.insert(
+                    modified_lines,
+                    p.vault_block.start_line + 1,
+                    original_content_indent .. vault_lines[j]
+                )
+            end
+
+            vim.api.nvim_buf_set_lines(p.bufnr, 0, -1, false, modified_lines)
+            close_popup()
+        end
+
+        local function finish_file_save()
+            vim.notify("File encrypted successfully", vim.log.levels.INFO)
+            Core.debug(config, "file encrypted via popup save")
+            local should_reload = source_can_reload()
+            close_popup()
+            if should_reload then
+                reload_source_buffer()
             end
         end
 
-        close_popup()
+        if p.vault_type == Core.VaultType.inline and p.vault_block then
+            local vault_lines, encrypt_err = Core.encrypt_content(config, current_content, encryption_options())
+            if vault_lines then
+                after_inline_encrypt_and_apply(vault_lines)
+                return
+            end
+
+            local ids = Core.extract_encrypt_vault_ids(encrypt_err or "")
+            if not ids or #ids == 0 then
+                fail("Failed to encrypt new content: " .. (encrypt_err or "unknown error"))
+                return
+            end
+
+            select_vault_id(ids, "Select vault-id for encryption", function(choice)
+                if not choice then
+                    saving = false
+                    vim.notify("Encryption cancelled (no vault-id selected)", vim.log.levels.WARN)
+                    return
+                end
+                if not source_is_unchanged() then
+                    saving = false
+                    return
+                end
+
+                local retry_lines, retry_err =
+                    Core.encrypt_content(config, current_content, encryption_options(choice))
+                if not retry_lines then
+                    fail("Failed to encrypt with selected vault-id: " .. (retry_err or "unknown error"))
+                    return
+                end
+                after_inline_encrypt_and_apply(retry_lines)
+            end)
+            return
+        end
+
+        local ok, enc_err =
+            Core.encrypt_file_with_content(config, p.file_path, current_content, encryption_options())
+        if ok then
+            finish_file_save()
+            return
+        end
+
+        local ids = Core.extract_encrypt_vault_ids(enc_err or "")
+        if not ids or #ids == 0 then
+            fail(enc_err or "Failed to encrypt file")
+            return
+        end
+
+        select_vault_id(ids, "Select vault-id for file encryption", function(choice)
+            if not choice then
+                saving = false
+                vim.notify("Encryption cancelled (no vault-id selected)", vim.log.levels.WARN)
+                return
+            end
+            if not source_is_unchanged() then
+                saving = false
+                return
+            end
+
+            local retry_ok, retry_err =
+                Core.encrypt_file_with_content(config, p.file_path, current_content, encryption_options(choice))
+            if not retry_ok then
+                fail(retry_err or "Failed to encrypt file")
+                return
+            end
+            finish_file_save()
+        end)
     end
 
     local function copy_to_clipboard()
