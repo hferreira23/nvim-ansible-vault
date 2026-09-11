@@ -43,6 +43,11 @@ These are provided by default. To disable the defaults, set `vim.g.ansible_vault
 2. The plugin decrypts via `ansible-vault view` and opens an editable popup.
 3. On save (`<C-s>` / `<CR>`), content is re‑encrypted using `ansible-vault encrypt_string` and written back.
 
+Whole-file saves use atomic replacement, preserve the file's permission bits and
+refuse to overwrite files changed by another process. `:AnsibleVaultEncryptFile`
+encrypts the current buffer contents, including unsaved edits, without first
+writing plaintext to disk.
+
 ### Popup controls
 | Action                | Key(s)                |
 |-----------------------|-----------------------|
@@ -89,3 +94,11 @@ vim.keymap.set("n", "<leader>ve", "<Cmd>AnsibleVaultEncryptInline<CR>", { desc =
 
 
 That's it! 🔐
+
+## Tests
+
+Run the headless Neovim regression suite with:
+
+```sh
+make test
+```

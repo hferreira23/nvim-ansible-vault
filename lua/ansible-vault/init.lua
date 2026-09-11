@@ -3,6 +3,7 @@ local Core = require("ansible-vault.core")
 local Popup = require("ansible-vault.popup")
 
 local M = {}
+local uv = vim.uv or vim.loop
 
 M.config = {
     vault_password_file = nil,
@@ -93,6 +94,10 @@ function M.vault_access(bufnr)
     if not vault_block then
         local file_is_vault = Core.check_is_file_vault(cfg, file_path)
         if file_is_vault then
+            if vim.bo[bufnr].modified then
+                vim.notify("Save or discard source-buffer changes before opening this vault", vim.log.levels.WARN)
+                return
+            end
             vault_type = Core.VaultType.file
             vault_name = vim.fs.basename(file_path)
         else
@@ -146,6 +151,7 @@ function M.vault_access(bufnr)
                 vault_name = vault_name,
                 decrypted_value = retry_value,
                 vault_block = vault_block,
+                password = pw,
             })
         end
         -- Prefer prompting only on auth-related failures; best effort check
@@ -169,24 +175,78 @@ function M.vault_access(bufnr)
     })
 end
 
-function M.encrypt_current_file(bufnr)
-    bufnr = bufnr or vim.api.nvim_get_current_buf()
-    local file_path = vim.api.nvim_buf_get_name(bufnr)
-    if file_path == "" then
-        vim.notify("Cannot encrypt without a file path", vim.log.levels.ERROR)
+local function encrypt_checked_buffer(bufnr, file_path)
+    local cfg = resolve_config_for_file(file_path)
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    if lines[1] and lines[1]:match("^%$ANSIBLE_VAULT;") then
+        vim.notify("File is already encrypted", vim.log.levels.WARN)
         return
     end
-    local cfg = resolve_config_for_file(file_path)
-    Core.debug(cfg, string.format("encrypt_current_file (file only) file=%s", file_path))
-    local cmd = Core.get_vault_command(cfg, "encrypt", file_path)
-    local cwd = (cfg.ansible_cfg_directory and cfg.ansible_cfg_directory ~= "")
-            and vim.fn.expand(cfg.ansible_cfg_directory)
-        or nil
-    local proc = vim.system(cmd, { text = true, cwd = cwd })
-    local res = proc:wait()
-    if res.code ~= 0 then
-        local ids = Core.extract_encrypt_vault_ids((res.stderr or res.stdout or ""))
-        if ids and #ids > 0 then
+
+    local plaintext = table.concat(lines, "\n")
+    if vim.bo[bufnr].endofline then
+        plaintext = plaintext .. "\n"
+    end
+    local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+    local function file_stamp()
+        local stat, _, code = uv.fs_stat(file_path)
+        if not stat then
+            return code or "missing"
+        end
+        return table.concat({ stat.dev, stat.ino, stat.size, stat.mtime.sec, stat.mtime.nsec }, ":")
+    end
+    local destination_stamp = file_stamp()
+    Core.debug(cfg, string.format("encrypt_current_file file=%s bytes=%d", file_path, #plaintext))
+
+    local function buffer_is_unchanged()
+        if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_name(bufnr) ~= file_path then
+            vim.notify("Encryption cancelled because the source buffer is no longer available", vim.log.levels.WARN)
+            return false
+        end
+        if vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick then
+            vim.notify("Encryption cancelled because the source buffer changed", vim.log.levels.WARN)
+            return false
+        end
+        if file_stamp() ~= destination_stamp then
+            vim.notify("Encryption cancelled because the destination file changed", vim.log.levels.WARN)
+            return false
+        end
+        return true
+    end
+
+    local function finish_encryption()
+        vim.notify("File encrypted successfully", vim.log.levels.INFO)
+        if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_name(bufnr) ~= file_path then
+            vim.notify("File was encrypted, but its source buffer is no longer available", vim.log.levels.WARN)
+            return
+        end
+        if vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick then
+            vim.notify("File was encrypted, but its changed source buffer was not reloaded", vim.log.levels.WARN)
+            return
+        end
+        local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
+            vim.cmd("silent keepalt edit!")
+        end)
+        if not ok then
+            vim.notify("File was encrypted, but its buffer could not be reloaded: " .. err, vim.log.levels.ERROR)
+        end
+    end
+
+    local try_encrypt
+    try_encrypt = function(opts)
+        opts = opts or {}
+        if not buffer_is_unchanged() then
+            return
+        end
+
+        local ok, err = Core.encrypt_file_with_content(cfg, file_path, plaintext, next(opts) and opts or nil)
+        if ok then
+            finish_encryption()
+            return
+        end
+
+        local ids = Core.extract_encrypt_vault_ids(err or "")
+        if ids and #ids > 0 and not opts.encrypt_vault_id then
             pcall(vim.cmd, "stopinsert")
             vim.schedule(function()
                 vim.ui.select(ids, { prompt = "Select vault-id for file encryption" }, function(choice)
@@ -194,33 +254,83 @@ function M.encrypt_current_file(bufnr)
                         vim.notify("Encryption cancelled (no vault-id selected)", vim.log.levels.WARN)
                         return
                     end
-                    local retry_cmd =
-                        Core.get_vault_command(cfg, "encrypt", file_path, { encrypt_vault_id = choice })
-                    local retry_proc = vim.system(retry_cmd, { text = true, cwd = cwd })
-                    local retry_res = retry_proc:wait()
-                    if retry_res.code ~= 0 then
-                        vim.notify(
-                            "Failed to encrypt file: " .. (retry_res.stderr or "unknown error"),
-                            vim.log.levels.ERROR
-                        )
-                        return
-                    end
-                    vim.notify("File encrypted successfully", vim.log.levels.INFO)
-                    vim.api.nvim_buf_call(bufnr, function()
-                        vim.cmd("edit!")
-                    end)
+                    try_encrypt(vim.tbl_extend("force", {}, opts, { encrypt_vault_id = choice }))
                 end)
             end)
             return
         end
-        vim.notify("Failed to encrypt file: " .. (res.stderr or "unknown error"), vim.log.levels.ERROR)
+
+        if err and err:match("[Pp]assword") and not opts.password then
+            pcall(vim.cmd, "stopinsert")
+            vim.schedule(function()
+                local password = vim.fn.inputsecret("Vault password (one-time): ")
+                if not password or password == "" then
+                    vim.notify("Encryption cancelled (no password provided)", vim.log.levels.WARN)
+                    return
+                end
+                try_encrypt(vim.tbl_extend("force", {}, opts, { password = password }))
+            end)
+            return
+        end
+
+        vim.notify("Failed to encrypt file: " .. (err or "unknown error"), vim.log.levels.ERROR)
+    end
+
+    try_encrypt()
+end
+
+function M.encrypt_current_file(bufnr)
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    local file_path = vim.api.nvim_buf_get_name(bufnr)
+    if file_path == "" then
+        vim.notify("Cannot encrypt without a file path", vim.log.levels.ERROR)
         return
     end
-    vim.notify("File encrypted successfully", vim.log.levels.INFO)
-    -- reload buffer to reflect on-disk encrypted content
-    vim.api.nvim_buf_call(bufnr, function()
-        vim.cmd("edit!")
+
+    local external_change = false
+    local check_autocmd = vim.api.nvim_create_autocmd("FileChangedShell", {
+        buffer = bufnr,
+        once = true,
+        callback = function()
+            external_change = true
+            vim.v.fcs_choice = ""
+        end,
+    })
+
+    local checked, check_err = pcall(vim.api.nvim_buf_call, bufnr, function()
+        -- `:checktime` invoked through the API is deferred; `:normal` gives it typed-command semantics.
+        vim.cmd("silent normal! :checktime\r")
     end)
+    pcall(vim.api.nvim_del_autocmd, check_autocmd)
+    if not checked then
+        vim.notify("Cannot check the destination file: " .. check_err, vim.log.levels.ERROR)
+        return
+    end
+    if external_change then
+        vim.notify("Encryption cancelled because the destination changed on disk", vim.log.levels.WARN)
+        return
+    end
+
+    if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_name(bufnr) ~= file_path then
+        vim.notify("Encryption cancelled because the source buffer is no longer available", vim.log.levels.WARN)
+        return
+    end
+
+    if not vim.bo[bufnr].modified and vim.fn.filereadable(file_path) == 1 then
+        local buffer_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        local disk_lines = vim.fn.readfile(file_path)
+        if #disk_lines == 0 then
+            disk_lines = { "" }
+        end
+        local binary_lines = vim.fn.readfile(file_path, "b")
+        local disk_has_eol = binary_lines[#binary_lines] == ""
+        if not vim.deep_equal(buffer_lines, disk_lines) or vim.bo[bufnr].endofline ~= disk_has_eol then
+            vim.notify("Encryption cancelled because the destination changed on disk", vim.log.levels.WARN)
+            return
+        end
+    end
+
+    encrypt_checked_buffer(bufnr, file_path)
 end
 
 ---Encrypt the YAML scalar value at cursor into an inline vault block

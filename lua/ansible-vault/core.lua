@@ -7,6 +7,7 @@
 
 ---@diagnostic disable: undefined-global
 local Core = {}
+local uv = vim.uv or vim.loop
 
 -- Derive working directory and executable from provided config
 local function get_cwd(config)
@@ -21,6 +22,141 @@ local function get_executable(config)
 		return vim.fn.expand(config.vault_executable)
 	end
 	return "ansible-vault"
+end
+
+local function write_all(fd, content)
+	local offset = 0
+	while offset < #content do
+		local written, err = uv.fs_write(fd, content:sub(offset + 1), offset)
+		if not written or written == 0 then
+			return nil, err or "write returned zero bytes"
+		end
+		offset = offset + written
+	end
+	return true
+end
+
+local function remove_file(path)
+	local called, removed, err = pcall(uv.fs_unlink, path)
+	if not called then
+		return nil, tostring(removed)
+	end
+	if not removed then
+		return nil, err or "failed to remove file"
+	end
+	return true
+end
+
+local function write_secure_file(path, content, mode)
+	local fd, open_err = uv.fs_open(path, "wx", mode)
+	if not fd then
+		return nil, open_err or "failed to open file"
+	end
+
+	local ok, err = uv.fs_fchmod(fd, mode)
+	if ok then
+		ok, err = write_all(fd, content)
+	end
+	if ok then
+		ok, err = uv.fs_fsync(fd)
+	end
+	local closed, close_err = uv.fs_close(fd)
+	if not ok or not closed then
+		remove_file(path)
+		return nil, err or close_err or "failed to close file"
+	end
+	return true
+end
+
+local function with_temporary_password_file(password, callback)
+	local path = vim.fn.tempname()
+	local ok, err = write_secure_file(path, password .. "\n", tonumber("600", 8))
+	if not ok then
+		return nil, "Failed to create temporary password file: " .. (err or "unknown error")
+	end
+
+	local called, result = pcall(callback, path)
+	local removed, remove_err = remove_file(path)
+	if not called then
+		local suffix = removed and "" or "; password-file cleanup failed: " .. remove_err
+		return nil, "Failed to run ansible-vault: " .. tostring(result) .. suffix
+	end
+	if not removed then
+		return nil, "Failed to remove temporary password file: " .. remove_err
+	end
+	return result
+end
+
+local function inspect_destination(file_path)
+	local target_path = file_path
+	local file_stat, stat_err, stat_code = uv.fs_lstat(file_path)
+	if file_stat and file_stat.type == "link" then
+		local resolved, resolve_err = uv.fs_realpath(file_path)
+		if not resolved then
+			return nil, "Failed to resolve vault symlink: " .. (resolve_err or "unknown error")
+		end
+		target_path = resolved
+		file_stat, stat_err, stat_code = uv.fs_stat(target_path)
+	end
+	if not file_stat and stat_code and stat_code ~= "ENOENT" then
+		return nil, "Failed to inspect vault file: " .. (stat_err or stat_code)
+	end
+	if file_stat and file_stat.type ~= "file" then
+		return nil, "Vault path is not a regular file"
+	end
+	if file_stat and file_stat.nlink and file_stat.nlink > 1 then
+		return nil, "Refusing to replace a vault file with multiple hard links"
+	end
+
+	local fingerprint
+	if file_stat then
+		fingerprint = table.concat({
+			file_stat.dev,
+			file_stat.ino,
+			file_stat.size,
+			file_stat.mtime.sec,
+			file_stat.mtime.nsec,
+		}, ":")
+	end
+	return {
+		target_path = target_path,
+		mode = file_stat and (file_stat.mode % 512) or tonumber("600", 8),
+		fingerprint = fingerprint,
+	}
+end
+
+local function atomic_write_ciphertext(file_path, lines, expected)
+	if not lines or not lines[1] or not lines[1]:match("^%$ANSIBLE_VAULT;") then
+		return nil, "Refusing to write invalid Ansible Vault ciphertext"
+	end
+
+	local temp_path = vim.fs.joinpath(
+		vim.fs.dirname(expected.target_path),
+		string.format(
+			".%s.nvim-ansible-vault.%d.%s",
+			vim.fs.basename(expected.target_path),
+			vim.fn.getpid(),
+			uv.hrtime()
+		)
+	)
+	local content = table.concat(lines, "\n") .. "\n"
+	local wrote, write_err = write_secure_file(temp_path, content, expected.mode)
+	if not wrote then
+		return nil, "Failed to write encrypted temporary file: " .. (write_err or "unknown error")
+	end
+
+	local current, inspect_err = inspect_destination(file_path)
+	if not current or current.target_path ~= expected.target_path or current.fingerprint ~= expected.fingerprint then
+		remove_file(temp_path)
+		return nil, inspect_err or "Vault file changed during encryption; refusing to overwrite it"
+	end
+
+	local renamed, rename_err = uv.fs_rename(temp_path, expected.target_path)
+	if not renamed then
+		remove_file(temp_path)
+		return nil, "Failed to replace vault file: " .. (rename_err or "unknown error")
+	end
+	return true
 end
 
 Core.VaultType = { inline = "inline", file = "file" }
@@ -201,26 +337,23 @@ function Core.decrypt_inline_content(config, vault_content, opts)
 	end
 	Core.debug(config, string.format("decrypt_inline via stdin(view) lines=%d", #stripped))
 	local args = { get_executable(config), "view", "-" }
-	local tmp_pw_file
 	if opts and opts.password and opts.password ~= "" then
-		tmp_pw_file = vim.fn.tempname()
-		local f = io.open(tmp_pw_file, "w")
-		if not f then
-			return nil, "Failed to create temporary password file"
+		local res, password_err = with_temporary_password_file(opts.password, function(password_file)
+			local password_args = vim.list_extend(vim.deepcopy(args), { "--vault-password-file", password_file })
+			return run_with_stdin(password_args, table.concat(stripped, "\n"), get_cwd(config))
+		end)
+		if not res then
+			return nil, password_err
 		end
-		f:write(opts.password)
-		f:write("\n")
-		f:close()
-		table.insert(args, "--vault-password-file")
-		table.insert(args, tmp_pw_file)
+		if res.code ~= 0 then
+			return nil, res.stderr ~= "" and res.stderr or res.stdout or "decrypt failed"
+		end
+		return res.stdout
 	elseif config.vault_password_file then
 		table.insert(args, "--vault-password-file")
 		table.insert(args, config.vault_password_file)
 	end
 	local res = run_with_stdin(args, table.concat(stripped, "\n"), get_cwd(config))
-	if tmp_pw_file then
-		pcall(os.remove, tmp_pw_file)
-	end
 	Core.debug(
 		config,
 		string.format("decrypt_inline(view) exit=%d out_len=%d err_len=%d", res.code or -1, #res.stdout, #res.stderr)
@@ -234,11 +367,11 @@ end
 ---Encrypt text content using ansible-vault encrypt_string
 ---@param config AnsibleVaultConfig
 ---@param value string
----@param opts? { encrypt_vault_id?: string }
+---@param opts? { encrypt_vault_id?: string, password?: string }
 function Core.encrypt_content(config, value, opts)
 	Core.debug(config, string.format("encrypt_content via encrypt_string bytes=%d", #value))
 	local args = { get_executable(config), "encrypt_string" }
-	if config.vault_password_file then
+	if config.vault_password_file and not (opts and opts.password and opts.password ~= "") then
 		table.insert(args, "--vault-password-file")
 		table.insert(args, config.vault_password_file)
 	end
@@ -248,7 +381,23 @@ function Core.encrypt_content(config, value, opts)
 	end
 	table.insert(args, "--stdin-name")
 	table.insert(args, "value")
-	local res = run_with_stdin(args, value, get_cwd(config))
+	local res, password_err
+	if opts and opts.password and opts.password ~= "" then
+		res, password_err = with_temporary_password_file(opts.password, function(password_file)
+			local password_args = vim.deepcopy(args)
+			if opts.encrypt_vault_id then
+				vim.list_extend(password_args, { "--vault-id", opts.encrypt_vault_id .. "@" .. password_file })
+			else
+				vim.list_extend(password_args, { "--vault-password-file", password_file })
+			end
+			return run_with_stdin(password_args, value, get_cwd(config))
+		end)
+	else
+		res = run_with_stdin(args, value, get_cwd(config))
+	end
+	if not res then
+		return nil, password_err
+	end
 	Core.debug(
 		config,
 		string.format(
@@ -263,18 +412,21 @@ function Core.encrypt_content(config, value, opts)
 	end
 	local output = res.stdout or ""
 	local out_lines = vim.split(output, "\n", { plain = true })
-	if #out_lines > 0 and out_lines[1]:match("^[^:]+:%s*!vault%s*|%s*$") then
-		local vault_lines = {}
-		for i = 2, #out_lines do
-			local l = out_lines[i]
-			if l ~= "" then
-				l = l:gsub("^%s+", "")
-			end
-			table.insert(vault_lines, l)
-		end
-		return vault_lines
+	if #out_lines == 0 or not out_lines[1]:match("^[^:]+:%s*!vault%s*|%-?%s*$") then
+		return nil, "Unexpected output from ansible-vault encrypt_string"
 	end
-	return out_lines
+
+	local vault_lines = {}
+	for i = 2, #out_lines do
+		vault_lines[#vault_lines + 1] = out_lines[i]:gsub("^%s+", "")
+	end
+	while vault_lines[#vault_lines] == "" do
+		table.remove(vault_lines)
+	end
+	if not vault_lines[1] or not vault_lines[1]:match("^%$ANSIBLE_VAULT;") then
+		return nil, "Unexpected output from ansible-vault encrypt_string"
+	end
+	return vault_lines
 end
 
 ---@param config AnsibleVaultConfig
@@ -284,25 +436,23 @@ end
 function Core.decrypt_file_vault(config, file_path, opts)
 	Core.debug(config, string.format("decrypt_file via system file=%s", file_path))
 	local args
-	local tmp_pw_file
 	if opts and opts.password and opts.password ~= "" then
-		tmp_pw_file = vim.fn.tempname()
-		local f = io.open(tmp_pw_file, "w")
-		if not f then
-			return nil, "Failed to create temporary password file"
+		local res, password_err = with_temporary_password_file(opts.password, function(password_file)
+			local password_args = { get_executable(config), "view", "--vault-password-file", password_file, file_path }
+			return vim.system(password_args, { text = true, cwd = get_cwd(config) }):wait()
+		end)
+		if not res then
+			return nil, password_err
 		end
-		f:write(opts.password)
-		f:write("\n")
-		f:close()
-		args = { get_executable(config), "view", "--vault-password-file", tmp_pw_file, file_path }
+		if res.code ~= 0 then
+			return nil, res.stderr or "Failed to view/decrypt file"
+		end
+		return res.stdout
 	else
 		args = Core.get_vault_command(config, "view", file_path)
 	end
 	local proc = vim.system(args, { text = true, cwd = get_cwd(config) })
 	local res = proc:wait()
-	if tmp_pw_file then
-		pcall(os.remove, tmp_pw_file)
-	end
 	Core.debug(
 		config,
 		string.format(
@@ -322,14 +472,21 @@ end
 ---@param config AnsibleVaultConfig
 ---@param file_path string
 ---@param plaintext string
----@param opts? { encrypt_vault_id?: string }
+---@param opts? { encrypt_vault_id?: string, password?: string }
 function Core.encrypt_file_with_content(config, file_path, plaintext, opts)
 	Core.debug(config, string.format("encrypt_file_with_content file=%s bytes=%d", file_path, #plaintext))
+	local destination, inspect_err = inspect_destination(file_path)
+	if not destination then
+		return nil, inspect_err
+	end
 	local enc_lines, err = Core.encrypt_content(config, plaintext, opts)
 	if not enc_lines then
 		return nil, err
 	end
-	vim.fn.writefile(enc_lines, file_path)
+	local wrote, write_err = atomic_write_ciphertext(file_path, enc_lines, destination)
+	if not wrote then
+		return nil, write_err
+	end
 	Core.debug(config, string.format("wrote encrypted file lines=%d", #enc_lines))
 	return true
 end
